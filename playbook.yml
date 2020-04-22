@@ -1,0 +1,128 @@
+---
+- hosts: localhost
+  vars:
+    bot_no: 2
+    async_timeout: 100
+    retry_no: 120
+    retry_interval: 1
+    docker_iface: eth0
+    tcpdump_outfile: portscan.pcap
+    tcpdump_timeout: 30
+    nmap_timeout: "{{ tcpdump_timeout+10 }}"
+    nmap_options: --defeat-rst-ratelimit
+    nmap_rate_step: 5000
+    host_volume_path: ~/work/tmp/data
+    bot_volume_path: /data
+  tasks:
+
+    - name: create network botnet networks
+      docker_network:
+        name: "botnet{{ item }}"
+        ipam_config:
+          - subnet: "172.{{20 + item|int}}.0.0/16"
+            gateway: "172.{{20 + item|int}}.0.254"
+            iprange: "172.{{20 + item|int}}.0.0/24"
+      with_sequence: start=1 end={{ bot_no }}
+      register: create_network
+      async: "{{ async_timeout }}"
+      poll: 0
+
+    - name: check networks are created
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ create_network.results }}"
+      register: job_result
+      until: job_result.finished
+      retries: "{{ retry_no }}"
+      delay: "{{ retry_interval }}"
+
+    - name: create bots and connect them to botnet networks
+      docker_container:
+        name: "bot{{ item  }}"
+        image: python:2.7
+        command: ["bash"]
+        tty: true
+        interactive: true
+        networks_cli_compatible: true
+        networks:
+          - name: "botnet{{ item }}" 
+        volumes:
+          - "{{ host_volume_path }}:{{ bot_volume_path }}"
+      with_sequence: start=1 end={{ bot_no }}
+      register: create_bots
+      async: "{{ async_timeout }}"
+      poll: 0
+
+    - name: check bot containers are created
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ create_bots.results }}"
+      register: job_result
+      until: job_result.finished
+      retries: "{{ retry_no }}"
+      delay: "{{ retry_interval }}"
+
+    #- name: add docker bots to inventory
+      #add_host:
+        #name: "bot{{ item  }}"
+        #groups: bots
+        #ansible_connection: docker
+      #with_sequence: start=1 end={{ bot_no  }}
+      #
+    - name: set bot_list variables
+      set_fact:
+        bot_list: "{{ bot_list | default([]) + ['bot' + item|string] }}"
+      loop: "{{ range(1, bot_no+1) | list}}"
+
+    - name: update apt
+      command: docker exec "{{ item }}" apt update
+      loop: "{{ bot_list }}"
+      register: update_apt
+      async: "{{ async_timeout }}"
+      poll: 0
+
+    - name: check apt is updated
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ update_apt.results }}"
+      register: job_result
+      until: job_result.finished
+      retries: "{{ retry_no }}"
+      delay: "{{ retry_interval }}"
+
+    - name: install nmap & tcpudmp on bots
+      command: docker exec "{{ item }}" apt install nmap tcpdump -y
+      loop: "{{ bot_list }}"
+      register: install_packages
+      async: "{{ async_timeout }}"
+      poll: 0
+
+    - name: check packages are installed
+      async_status:
+        jid: "{{ item.ansible_job_id }}"
+      loop: "{{ install_packages.results }}"
+      register: job_result
+      until: job_result.finished
+      retries: "{{ retry_no }}"
+      delay: "{{ retry_interval }}"
+
+    - name: find ip of bots
+      command: "docker inspect -f {% raw %} '{{range .NetworkSettings.Networks}}{{.IPAddress}}{{end}}' {% endraw %} {{ item }}"
+      loop: "{{ bot_list }}"
+      register: ips
+
+    - name: start tcpdump in bot background
+      command: "docker exec -d {{ item }} timeout {{ tcpdump_timeout }} tcpdump -i {{ docker_iface }} -w {{ bot_volume_path }}/{{ item }}_{{ tcpdump_outfile }}"
+      loop: "{{ bot_list }}"
+      async: "{{ tcpdump_timeout }}"
+      poll: 0
+
+    - name: start port scanning with namp (subnet/16)
+      command: "docker exec -d {{ item.0 }} timeout {{ nmap_timeout }} nmap 192.168.0.0/16 {{ nmap_options }} --min-rate {{ item.1 }} --max-rate {{ item.1 }}"
+      with_together: 
+        - "{{ bot_list }}"
+        - "{{ range(nmap_rate_step, nmap_rate_step*(bot_no+1), nmap_rate_step) | list}}"
+        - "{{ ips.results }}"
+      async: "{{ nmap_timeout }}"
+      poll: 0
+
